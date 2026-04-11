@@ -4,15 +4,12 @@ defmodule LazyFileStream do
   """
 
   @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> LazyFileStream.hello()
-      :world
-
+  Returns all lines from the file at `path` that are longer than 80 characters.
+  Trailing newlines are trimmed before the length check.
   """
-  def hello do
-    :world
+  def large_lines!(path) do
+    File.stream!(path)
+    |> Stream.map(&String.trim_trailing(&1, "\n"))
+    |> Enum.filter(&(String.length(&1) > 80))
   end
 end
