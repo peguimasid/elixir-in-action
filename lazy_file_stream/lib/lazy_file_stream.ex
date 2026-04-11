@@ -1,12 +1,4 @@
 defmodule LazyFileStream do
-  @moduledoc """
-  Documentation for `LazyFileStream`.
-  """
-
-  @doc """
-  Returns all lines from the file at `path` that are longer than 80 characters.
-  Trailing newlines are trimmed before the length check.
-  """
   def large_lines!(path) do
     File.stream!(path)
     |> Stream.map(&String.trim_trailing(&1, "\n"))
