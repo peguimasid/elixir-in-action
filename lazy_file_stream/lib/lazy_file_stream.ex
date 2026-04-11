@@ -24,4 +24,12 @@ defmodule LazyFileStream do
     |> Stream.map(&String.trim_trailing(&1, "\n"))
     |> Enum.max_by(&String.length/1)
   end
+
+  def words_per_line!(path) do
+    path
+    |> File.stream!()
+    |> Stream.map(&String.trim_trailing(&1, "\n"))
+    |> Stream.map(&String.split/1)
+    |> Enum.map(&length/1)
+  end
 end
