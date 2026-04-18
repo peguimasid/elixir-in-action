@@ -38,12 +38,22 @@ end
 defmodule TodoList.CsvImporter do
   def import(path) do
     path
+    |> read_lines()
+    |> create_entries()
+    |> TodoList.new()
+  end
+
+  defp read_lines(path) do
+    path
     |> File.stream!()
     |> Stream.map(&String.trim_trailing(&1, "\n"))
-    |> Stream.map(&String.split(&1, ","))
-    |> Enum.map(fn [date, task] ->
-      %{date: Date.from_iso8601!(date), title: task}
+  end
+
+  defp create_entries(lines) do
+    Stream.map(lines, fn line ->
+      [date_string, title] = String.split(line, ",")
+      date = Date.from_iso8601!(date_string)
+      %{date: date, title: title}
     end)
-    |> TodoList.new()
   end
 end
