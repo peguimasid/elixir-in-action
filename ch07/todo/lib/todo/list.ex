@@ -9,7 +9,7 @@ defmodule Todo.List do
     )
   end
 
-  def add_entry(todo_list, entry) do
+  def add_entry(%Todo.List{} = todo_list, entry) do
     entry = Map.put(entry, :id, todo_list.next_id)
     new_entries = Map.put(todo_list.entries, todo_list.next_id, entry)
 
@@ -22,7 +22,7 @@ defmodule Todo.List do
     |> Enum.filter(fn entry -> entry.date == date end)
   end
 
-  def update_entry(todo_list, entry_id, updater_fun) do
+  def update_entry(%Todo.List{} = todo_list, entry_id, updater_fun) do
     case Map.fetch(todo_list.entries, entry_id) do
       :error ->
         todo_list
@@ -34,7 +34,7 @@ defmodule Todo.List do
     end
   end
 
-  def delete_entry(todo_list, entry_id) do
+  def delete_entry(%Todo.List{} = todo_list, entry_id) do
     %Todo.List{todo_list | entries: Map.delete(todo_list.entries, entry_id)}
   end
 end
