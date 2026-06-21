@@ -1,71 +1,80 @@
-# Todo Links — Chapter 8
+# Supervise Database — Chapter 9
 
-This project builds directly on `supervised_todo_cache`. The supervision tree and overall architecture are identical — the only change is replacing every bare `start` call with `start_link` so that child processes are **linked** to the process that spawned them.
+This project builds on `todo_links` (ch08). The linking story is already solved — every child is started with `start_link`. The new focus is **supervision granularity**: moving `Todo.Database` out of `Todo.Cache` and directly under the top-level supervisor so that crashes in the database subtree don't tear down the entire cache.
 
-## The Problem: Dangling Processes
+## The Problem: Over-coupled Crash Scope
 
-In `supervised_todo_cache`, `Todo.Cache` starts its children with plain `start`:
-
-```elixir
-# supervised_todo_cache — no link
-Todo.Database.start()
-{:ok, new_server} = Todo.Server.start(todo_list_name)
-```
-
-`start` spawns the child but does **not** create a process link. If `Todo.Cache` crashes and the supervisor restarts it:
-
-- `init/1` runs again and starts a brand-new `Todo.Database`
-- The old `Todo.Database` (and its 3 workers) keeps running as an **orphan** — no owner, never restarted, never cleaned up
-- Every `Todo.Server` that was spawned on demand also keeps running as an orphan, holding stale state and wasting memory
-
-Over time this leaks processes and can cause subtle bugs (e.g. two databases racing to write the same file).
-
-## The Fix: `start_link`
-
-`todo_links` switches every child startup to `start_link`:
+In `todo_links`, `Todo.Cache.init/1` starts the database:
 
 ```elixir
-# todo_links — linked
-Todo.Database.start_link()
-{:ok, new_server} = Todo.Server.start_link(todo_list_name)
+# todo_links — database is a child of the cache
+def init(_) do
+  Todo.Database.start_link()
+  {:ok, %{}}
+end
 ```
 
-`start_link` creates a **bidirectional link** between the caller and the spawned process. Links propagate exits: if either end crashes, the other receives an exit signal and terminates as well (unless it is trapping exits).
+Because `Todo.Database` is linked to `Todo.Cache`, a failure anywhere in the database subtree propagates upward:
 
-With links in place:
+```
+DatabaseWorker crash
+  → Todo.Database crashes
+    → Todo.Cache crashes (linked)
+      → Supervisor restarts Todo.Cache
+        → Every active Todo.Server is killed
+```
 
-- If `Todo.Cache` crashes → the exit signal travels down the link to `Todo.Database`, which terminates; `Todo.Database`'s own exit signal propagates to each of its 3 `DatabaseWorker` processes, which also terminate. Every `Todo.Server` linked to the cache terminates too. No orphans survive.
-- The supervisor then restarts `Todo.Cache` fresh, which re-runs `init/1` and starts a clean `Todo.Database` with clean workers.
-- If a `Todo.DatabaseWorker` crashes → the exit propagates up to `Todo.Database`, which crashes, which propagates up to `Todo.Cache`, which crashes, and the supervisor restarts the whole subtree cleanly.
+A transient disk error in a single worker wipes out all in-flight todo sessions — far more disruption than necessary.
+
+## The Fix: Sibling Supervision
+
+`supervise_database` removes the `Todo.Database.start_link()` call from `Todo.Cache.init/1` and registers `Todo.Database` as a **sibling** child of the supervisor:
+
+```elixir
+# Todo.System
+Supervisor.start_link(
+  [
+    Todo.Database,  # ← now a direct supervisor child
+    Todo.Cache
+  ],
+  strategy: :one_for_one
+)
+```
+
+With `:one_for_one`, each child is restarted independently. A crash in `Todo.Database` (or any of its workers) only restarts the database subtree — `Todo.Cache` and all its `Todo.Server` processes stay alive.
 
 ## Process Tree
 
 ```
 Supervisor (:one_for_one)
+├── Todo.Database
+│     ├───(linked)──> DatabaseWorker #0
+│     ├───(linked)──> DatabaseWorker #1
+│     └───(linked)──> DatabaseWorker #2
 └── Todo.Cache
-    ├───(linked)──> Todo.Database
-    │                   ├───(linked)──> DatabaseWorker #0
-    │                   ├───(linked)──> DatabaseWorker #1
-    │                   └───(linked)──> DatabaseWorker #2
-    ├───(linked)──> Todo.Server "alice"
-    ├───(linked)──> Todo.Server "bob"
-    └─── ...
+      ├───(linked)──> Todo.Server "alice"
+      ├───(linked)──> Todo.Server "bob"
+      └─── ...
 ```
 
 **Legend:**
-- Arrows (`───(linked)──>`) show processes started with `start_link`, meaning they are linked to their parent.
-- If any process in a subtree crashes, all its linked children are terminated with it—no orphaned processes remain.
+- `───(linked)──>` — process started with `start_link`; a crash in either direction terminates both.
+- `Todo.Database` and `Todo.Cache` are siblings under the supervisor. Crashing one does **not** affect the other.
 
-Every arrow is a `start_link` link. A crash anywhere in the tree tears down the entire subtree — and nothing is left dangling.
+## Crash Isolation in Practice
 
-## What Changed vs `supervised_todo_cache`
-
-| File | Before (`supervised_todo_cache`) | After (`todo_links`) |
+| What crashes | What gets restarted | What survives |
 |---|---|---|
-| `Todo.Cache.init/1` | `Todo.Database.start()` | `Todo.Database.start_link()` |
-| `Todo.Cache.handle_call/3` | `Todo.Server.start(name)` | `Todo.Server.start_link(name)` |
+| `DatabaseWorker` | `DatabaseWorker` → `Todo.Database` (and its workers) | `Todo.Cache` + all `Todo.Server`s |
+| `Todo.Cache` | `Todo.Cache` (and all its `Todo.Server`s) | `Todo.Database` + its workers |
+| `Todo.Server "alice"` | `Todo.Server "alice"` only | Everything else |
 
-Everything else — the supervisor setup, the database pool, the server logic, persistence — is unchanged.
+## What Changed vs `todo_links`
+
+| File | Before (`todo_links`) | After (`supervise_database`) |
+|---|---|---|
+| `Todo.Cache.init/1` | calls `Todo.Database.start_link()` | removed — database is no longer a cache child |
+| `Todo.System.start_link/0` | supervises only `Todo.Cache` | supervises both `Todo.Database` and `Todo.Cache` |
 
 ## Try It in IEx
 
@@ -79,13 +88,11 @@ bobs_list = Todo.Cache.server_process("bob's list")
 # Add an entry
 Todo.Server.add_entry(bobs_list, %{date: ~D[2023-12-19], title: "Dentist"})
 
-# Read entries back
-Todo.Server.entries(bobs_list, ~D[2023-12-19])
+# Kill a DatabaseWorker — only the database subtree restarts
+db_pid = Process.whereis(Todo.Database)
+Process.exit(db_pid, :kill)
 
-# Kill the cache — the supervisor restarts it; all linked children die with it
-cache_pid = Process.whereis(Todo.Cache)
-Process.exit(cache_pid, :kill)
-
-# The supervisor brings back a clean cache (and a clean database) automatically
-Process.whereis(Todo.Cache)
+# Cache and Todo.Server for "bob" are still alive
+Process.whereis(Todo.Cache)   # still the same PID
+bobs_list                     # still valid
 ```
