@@ -1,110 +1,74 @@
-# Dynamic Workers — Chapter 9
+# Todo Metrics — Chapter 10
 
-This project builds on `pool_supervision` (ch09). The database supervisor, the worker registry, and `Todo.System` are kept exactly as they were; the focus here is **managing an unbounded, unpredictable set of `Todo.Server` processes with a `DynamicSupervisor`**.
+This project builds on `dynamic_workers` (ch09). The whole supervision tree — `Todo.ProcessRegistry`, `Todo.Database` and its worker pool, and `Todo.Cache` as a `DynamicSupervisor` — is kept exactly as it was; the focus here is **adding a long-running background job that periodically reports system metrics using a `Task`**.
 
-## The Problem: `Todo.Cache` Was a Bottleneck Coordinator
+## The Goal: A Recurring Background Job
 
-In `pool_supervision`, `Todo.Cache` is a plain `GenServer` that keeps a `%{name => pid}` map in its state and starts a new `Todo.Server` on demand:
+We want the system to periodically report on its own health — how much memory it's using and how many processes are alive — without blocking or interfering with any of the to-do work. This is a classic *background job*: it runs forever, does a little work on a timer, and needs to sit under supervision like everything else.
+
+A plain `GenServer` would work, but it's overkill: there are no calls, no casts, and no client API — nothing ever talks to this process. It just loops. `Task` is the right abstraction for exactly this kind of self-contained, "start it and let it run" process.
+
+## The Fix: `Todo.Metrics` as a Supervised `Task`
+
+`Todo.Metrics` uses `Task` and exposes a `start_link/1` that spawns a process running a `loop/0`:
 
 ```elixir
-# Todo.Cache (pool_supervision) — a GenServer holding every PID in its state
-def server_process(todo_list_name) do
-  GenServer.call(__MODULE__, {:server_process, todo_list_name})
-end
+defmodule Todo.Metrics do
+  use Task
 
-def handle_call({:server_process, todo_list_name}, _, todo_servers) do
-  case Map.fetch(todo_servers, todo_list_name) do
-    {:ok, todo_server} ->
-      {:reply, todo_server, todo_servers}
+  def start_link(_arg) do
+    Task.start_link(&loop/0)
+  end
 
-    :error ->
-      {:ok, new_server} = Todo.Server.start_link(todo_list_name)
-      todo_servers = Map.put(todo_servers, todo_list_name, new_server)
-      {:reply, new_server, todo_servers}
+  def loop() do
+    Process.sleep(:timer.seconds(10))
+    IO.inspect(collect_metadata())
+    loop()
+  end
+
+  def collect_metadata() do
+    [
+      memory_usage: :erlang.memory(:total),
+      process_count: :erlang.system_info(:process_count)
+    ]
   end
 end
 ```
 
-This has the same problem the database coordinator had before `pool_supervision`: every single `server_process/1` lookup — for every to-do list, by every caller — is serialized through one process's mailbox. It's also a structural supervisor of sorts (it decides whether to start a server), but it isn't a *real* supervisor, so a crashed `Todo.Server` is never restarted and a crash in `Todo.Cache` itself takes down every list at once along with the whole PID map.
+A few things worth noting:
 
-## The Fix: `Todo.Cache` Becomes a `DynamicSupervisor`
+- **`use Task`** injects a default `child_spec/1`, so `Todo.Metrics` can be dropped straight into a supervisor's child list by module name.
+- **`Task.start_link/1`** links the task to its supervisor, so a crash propagates and the supervisor's restart policy kicks in.
+- **The infinite `loop/0`** is what makes this a long-running job rather than a one-shot task: it sleeps 10 seconds, inspects the collected metadata, then recurses. Because it never returns, the process stays alive under supervision.
+- **`collect_metadata/0`** reads two BEAM runtime stats — total memory (`:erlang.memory(:total)`) and the live process count (`:erlang.system_info(:process_count)`).
 
-`dynamic_workers` turns `Todo.Cache` into a `DynamicSupervisor` — a supervisor designed for children that are started one at a time, on demand, with no fixed list known up front (exactly the to-do-list-per-name shape we have here).
+## Wiring It Into `Todo.System`
+
+`Todo.Metrics` is added as the first child of the top-level supervisor:
 
 ```elixir
-defmodule Todo.Cache do
-  def start_link() do
-    IO.puts("Starting to-do cache.")
-    DynamicSupervisor.start_link(name: __MODULE__, strategy: :one_for_one)
-  end
-
-  def child_spec(_arg) do
-    %{
-      id: __MODULE__,
-      start: {__MODULE__, :start_link, []},
-      type: :supervisor
-    }
-  end
-
-  def server_process(todo_list_name) do
-    case start_child(todo_list_name) do
-      {:ok, pid} -> pid
-      {:error, {:already_started, pid}} -> pid
-    end
-  end
-
-  defp start_child(todo_list_name) do
-    DynamicSupervisor.start_child(__MODULE__, {Todo.Server, todo_list_name})
+defmodule Todo.System do
+  def start_link do
+    Supervisor.start_link(
+      [
+        Todo.Metrics,
+        Todo.ProcessRegistry,
+        Todo.Database,
+        Todo.Cache
+      ],
+      strategy: :one_for_one
+    )
   end
 end
 ```
 
-Two things disappear completely:
-
-- **The state map.** `DynamicSupervisor` already tracks its children; `Todo.Cache` no longer needs to hold `%{name => pid}` itself.
-- **The serialized `GenServer.call`.** `start_child` still goes through the supervisor's mailbox, but `Map.fetch`/`Map.put` bookkeeping is gone — the supervisor's own child-tracking does that job.
-
-Just like `Todo.Database` in `pool_supervision`, `Todo.Cache` needs a custom `child_spec/1` so its parent (`Todo.System`) starts it correctly and treats it as a supervisor (not a worker) for restart purposes.
-
-## The Problem: "Already Started" Is Now Possible
-
-A `DynamicSupervisor` has no idea that two different callers might ask for the *same* `todo_list_name` at the same time — it will happily try to start two children for "bob's list". For that to fail gracefully instead of creating duplicate servers, `Todo.Server` needs a stable, registry-backed identity, the same mechanism `pool_supervision` already introduced for `DatabaseWorker`.
-
-## The Fix: `Todo.Server` Registers Itself by Name
-
-`Todo.Server` now registers under a `via_tuple` in `Todo.ProcessRegistry`, exactly like `DatabaseWorker` does:
-
-```elixir
-defmodule Todo.Server do
-  use GenServer, restart: :temporary
-
-  def start_link(name) do
-    GenServer.start_link(Todo.Server, name, name: via_tuple(name))
-  end
-
-  defp via_tuple(name) do
-    Todo.ProcessRegistry.via_tuple({__MODULE__, name})
-  end
-
-  # ...
-end
-```
-
-This makes `start_child/1` idempotent: if a `Todo.Server` for "bob's list" is already registered, the registry rejects the second `start_link` with `{:error, {:already_started, pid}}`, which `DynamicSupervisor.start_child/2` propagates back to `Todo.Cache.server_process/1`. `server_process/1` handles both outcomes identically, so callers always get back the one live PID for that name regardless of how many processes raced to request it.
-
-## `restart: :temporary` — Why To-Do Servers Should *Not* Restart
-
-`Todo.Server` also adds `use GenServer, restart: :temporary`. Compare the two workers under `Todo.Cache`'s supervision:
-
-- `Todo.DatabaseWorker` (under `Todo.Database`, a plain `Supervisor`) keeps the default `:permanent` restart — if a database worker crashes, the data it manages is still expected to exist, so it must come back.
-- `Todo.Server` represents one user's in-memory to-do list. If it crashes, restarting it from scratch with no arguments wouldn't even work — `DynamicSupervisor` only knows the `{Todo.Server, name}` child spec used at the *first* `start_child` call, and on crash it has nothing to restart with. More importantly, the list isn't actually lost: it was already persisted to `Todo.Database` on every `add_entry`, so the next call to `Todo.Cache.server_process/1` simply starts a fresh `Todo.Server` that reloads the list from disk via `handle_continue(:init, ...)`.
-
-`:temporary` tells the supervisor "never restart this child automatically" — fitting for a process whose lifecycle is driven entirely by caller demand, not by supervision policy.
+Under `:one_for_one`, `Todo.Metrics` is fully independent: if the metrics task crashes it is restarted on its own, and if it were to be removed nothing else in the tree would notice. Because it neither depends on nor is depended upon by the other children, its position in the list doesn't matter for startup ordering.
 
 ## Process Tree
 
 ```
 Supervisor (:one_for_one)
+├── Todo.Metrics  (Task — loops forever, prints metrics every 10s)
 ├── Todo.ProcessRegistry  (Registry — holds name→pid mappings)
 ├── Todo.Database  (Supervisor :one_for_one)
 │     ├── DatabaseWorker #1  (registered as {DatabaseWorker, 1})
@@ -116,49 +80,39 @@ Supervisor (:one_for_one)
       └── ... (children added on demand, never known up front)
 ```
 
-## What Changed vs `pool_supervision`
+## What Changed vs `dynamic_workers`
 
-| File | Before (`pool_supervision`) | After (`dynamic_workers`) |
+| File | Before (`dynamic_workers`) | After (`todo_metrics`) |
 |---|---|---|
-| `Todo.Cache` | `GenServer` — keeps a `%{name => pid}` map, serializes lookups through `handle_call` | `DynamicSupervisor` — children started on demand via `start_child/2`, no manual state map |
-| `Todo.Server` | started anonymously via `GenServer.start_link/2`, default `:permanent` restart | registered via `via_tuple/1` in `Todo.ProcessRegistry`, `restart: :temporary` |
-| `Todo.Database`, `Todo.DatabaseWorker`, `Todo.ProcessRegistry`, `Todo.System` | unchanged | unchanged |
+| `Todo.Metrics` | did not exist | new `Task` that loops forever, printing memory usage and process count every 10 seconds |
+| `Todo.System` | supervises `Todo.ProcessRegistry`, `Todo.Database`, `Todo.Cache` | additionally supervises `Todo.Metrics` as its first child |
+| `Todo.Cache`, `Todo.Server`, `Todo.Database`, `Todo.DatabaseWorker`, `Todo.ProcessRegistry` | unchanged | unchanged |
 
-## Crash Isolation
+## `Task` vs `GenServer` for Background Work
 
-| What crashes | What gets restarted | What survives |
+| | `Task` (`Todo.Metrics`) | `GenServer` |
 |---|---|---|
-| `Todo.Server` for "bob" | **nothing automatically** (`:temporary`) — next `server_process("bob's list")` call starts a fresh one, reloaded from `Todo.Database` | All other to-do servers, `Todo.Cache`, `Todo.Database` and its workers |
-| `Todo.Cache` (the `DynamicSupervisor` itself) | `Todo.Cache` restarts empty; in-flight `Todo.Server`s are gone, but their data is safe in `Todo.Database` | `Todo.Database` + its workers, `Todo.ProcessRegistry` |
-| `DatabaseWorker #2` | `DatabaseWorker #2` only (re-registers itself) | Everything else, including all `Todo.Server`s |
+| Client API (calls/casts) | none — nothing sends it messages | expected — request/response is the point |
+| State | none — everything lives in the loop's arguments | explicit process state |
+| Best fit | fire-and-forget or self-driven loops | request handling, stateful coordination |
+
+Since nobody ever queries the metrics process and it holds no meaningful state, `Task` keeps it minimal while still being a first-class, supervised OTP process.
 
 ## Try It in IEx
 
 ```elixir
-# Start the supervision tree
+# Start the supervision tree — Todo.Metrics starts looping immediately
 {:ok, _sup} = Todo.System.start_link()
 
-# Add an entry for bob — Todo.Cache dynamically starts a Todo.Server for this name
+# Wait ~10 seconds and you'll see output like:
+#=> [memory_usage: 34012345, process_count: 84]
+
+# The rest of the to-do system works exactly as in dynamic_workers
 bobs_list = Todo.Cache.server_process("bob's list")
 Todo.Server.add_entry(bobs_list, %{date: ~D[2024-01-10], title: "Buy milk"})
-
-# Verify it was persisted
 Todo.Server.entries(bobs_list, ~D[2024-01-10])
 
-# Calling server_process/1 again for the same name returns the same PID,
-# even though two DynamicSupervisor.start_child calls happen under the hood
-^bobs_list = Todo.Cache.server_process("bob's list")
-
-# Kill bob's server — it is NOT restarted (restart: :temporary)
-Process.exit(bobs_list, :kill)
-Process.alive?(bobs_list)
-#=> false
-
-# But the data survives: the next lookup starts a brand-new process
-# that reloads the list from Todo.Database
-new_bobs_list = Todo.Cache.server_process("bob's list")
-new_bobs_list != bobs_list
-#=> true
-Todo.Server.entries(new_bobs_list, ~D[2024-01-10])
-#=> still shows "Buy milk"
+# Adding more servers bumps the process_count reported by Todo.Metrics
+Enum.each(1..50, &Todo.Cache.server_process("list-#{&1}"))
+# next metrics tick will show a higher process_count
 ```
