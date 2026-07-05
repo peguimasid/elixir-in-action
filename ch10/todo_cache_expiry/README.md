@@ -1,68 +1,83 @@
-# Todo Metrics — Chapter 10
+# Todo Cache Expiry — Chapter 10
 
-This project builds on `dynamic_workers` (ch09). The whole supervision tree — `Todo.ProcessRegistry`, `Todo.Database` and its worker pool, and `Todo.Cache` as a `DynamicSupervisor` — is kept exactly as it was; the focus here is **adding a long-running background job that periodically reports system metrics using a `Task`**.
+This project builds on `todo_metrics` (ch10). The supervision tree, `Todo.Cache`, `Todo.Database` and its worker pool, `Todo.ProcessRegistry`, and the periodic `Todo.Metrics` task are all kept exactly as they were; the focus here is **making idle `Todo.Server` processes expire on their own using `GenServer` timeouts**.
 
-## The Goal: A Recurring Background Job
+## The Goal: Stop Paying for Idle Servers
 
-We want the system to periodically report on its own health — how much memory it's using and how many processes are alive — without blocking or interfering with any of the to-do work. This is a classic *background job*: it runs forever, does a little work on a timer, and needs to sit under supervision like everything else.
+Every to-do list gets its own `Todo.Server` process, started on demand and kept alive under `Todo.Cache`'s `DynamicSupervisor` forever — even after nobody has touched it in hours. That's wasted memory: an in-memory `Todo.List` sitting in a process nobody is using. Since the list is always persisted to `Todo.Database` on every write, a `Todo.Server` doesn't actually need to stay alive between requests — it can safely shut down when idle and be recreated later, transparently, from whatever was last saved.
 
-A plain `GenServer` would work, but it's overkill: there are no calls, no casts, and no client API — nothing ever talks to this process. It just loops. `Task` is the right abstraction for exactly this kind of self-contained, "start it and let it run" process.
+## The Fix: A `GenServer` Timeout That Ends the Process
 
-## The Fix: `Todo.Metrics` as a Supervised `Task`
-
-`Todo.Metrics` uses `Task` and exposes a `start_link/1` that spawns a process running a `loop/0`:
+`Todo.Server` gains a module attribute for the idle threshold and passes it as the timeout value in every `{:noreply, ...}` / `{:reply, ...}` tuple it returns:
 
 ```elixir
-defmodule Todo.Metrics do
-  use Task
+defmodule Todo.Server do
+  use GenServer, restart: :temporary
 
-  def start_link(_arg) do
-    Task.start_link(&loop/0)
+  # ... start_link/1, add_entry/2, entries/2, via_tuple/1 unchanged ...
+
+  @expiry_idle_timeout :timer.seconds(10)
+
+  @impl GenServer
+  def init(name) do
+    IO.puts("Starting to-do server for #{name}.")
+    {:ok, {name, nil}, {:continue, :init}}
   end
 
-  def loop() do
-    Process.sleep(:timer.seconds(10))
-    IO.inspect(collect_metadata())
-    loop()
+  @impl GenServer
+  def handle_continue(:init, {name, nil}) do
+    todo_list = Todo.Database.get(name) || Todo.List.new()
+    {:noreply, {name, todo_list}, @expiry_idle_timeout}
   end
 
-  def collect_metadata() do
-    [
-      memory_usage: :erlang.memory(:total),
-      process_count: :erlang.system_info(:process_count)
-    ]
+  @impl GenServer
+  def handle_cast({:add_entry, new_entry}, {name, todo_list}) do
+    new_list = Todo.List.add_entry(todo_list, new_entry)
+    Todo.Database.store(name, new_list)
+    {:noreply, {name, new_list}, @expiry_idle_timeout}
+  end
+
+  @impl GenServer
+  def handle_call({:entries, date}, _, {name, todo_list}) do
+    {:reply, Todo.List.entries(todo_list, date), {name, todo_list}, @expiry_idle_timeout}
+  end
+
+  @impl GenServer
+  def handle_info(:timeout, {name, todo_list}) do
+    IO.puts("Stopping to-do server for #{name}")
+    {:stop, :normal, {name, todo_list}}
   end
 end
 ```
 
 A few things worth noting:
 
-- **`use Task`** injects a default `child_spec/1`, so `Todo.Metrics` can be dropped straight into a supervisor's child list by module name.
-- **`Task.start_link/1`** links the task to its supervisor, so a crash propagates and the supervisor's restart policy kicks in.
-- **The infinite `loop/0`** is what makes this a long-running job rather than a one-shot task: it sleeps 10 seconds, inspects the collected metadata, then recurses. Because it never returns, the process stays alive under supervision.
-- **`collect_metadata/0`** reads two BEAM runtime stats — total memory (`:erlang.memory(:total)`) and the live process count (`:erlang.system_info(:process_count)`).
+- **`@expiry_idle_timeout :timer.seconds(10)`** is the fourth element every callback now returns alongside its state. In `GenServer`, this value tells OTP "if no message arrives within this many milliseconds, send me a `:timeout` message" — and the timer resets on *every* handled message, so it only fires after a genuine idle period.
+- **Every `handle_continue/2`, `handle_cast/2`, and `handle_call/3` clause passes `@expiry_idle_timeout`.** Missing it on even one clause would mean that particular transition never re-arms the timer, so the timeout has to be threaded through consistently.
+- **`handle_info(:timeout, ...)`** is the new callback that actually reacts to the timer firing. It logs and returns `{:stop, :normal, state}`, which terminates the process cleanly — `:normal` is not treated as a crash, so no error is logged and no supervisor alarm is raised.
+- **`restart: :temporary` is what makes this safe.** Because `Todo.Cache`'s `DynamicSupervisor` never restarts a `:temporary` child, the expired process simply disappears; it is not immediately respawned. `Todo.Cache.server_process/1` is the only thing that brings a `Todo.Server` back, and only when someone asks for it again.
+- **No data is lost.** Every write already goes through `Todo.Database.store/2` before the process replies, so by the time a server times out, its in-memory state has long since been durably persisted. The next `Todo.Cache.server_process/1` call simply starts a fresh process that reloads the same list via `Todo.Database.get/1`.
 
-## Wiring It Into `Todo.System`
+## Wiring: Nothing Changes
 
-`Todo.Metrics` is added as the first child of the top-level supervisor:
+`Todo.Cache` still looks up or starts a `Todo.Server` the same way it always has — it has no idea whether the process it gets back is the original one or a freshly-restarted one:
 
 ```elixir
-defmodule Todo.System do
-  def start_link do
-    Supervisor.start_link(
-      [
-        Todo.Metrics,
-        Todo.ProcessRegistry,
-        Todo.Database,
-        Todo.Cache
-      ],
-      strategy: :one_for_one
-    )
+defmodule Todo.Cache do
+  def server_process(todo_list_name) do
+    case start_child(todo_list_name) do
+      {:ok, pid} -> pid
+      {:error, {:already_started, pid}} -> pid
+    end
+  end
+
+  defp start_child(todo_list_name) do
+    DynamicSupervisor.start_child(__MODULE__, {Todo.Server, todo_list_name})
   end
 end
 ```
 
-Under `:one_for_one`, `Todo.Metrics` is fully independent: if the metrics task crashes it is restarted on its own, and if it were to be removed nothing else in the tree would notice. Because it neither depends on nor is depended upon by the other children, its position in the list doesn't matter for startup ordering.
+If the old process already expired and exited, `Todo.ProcessRegistry` no longer has an entry for it, so `start_child/1` succeeds with a brand-new pid instead of hitting `{:error, {:already_started, pid}}`. Either way, the caller gets back a live `Todo.Server` it can use.
 
 ## Process Tree
 
@@ -75,44 +90,51 @@ Supervisor (:one_for_one)
 │     ├── DatabaseWorker #2  (registered as {DatabaseWorker, 2})
 │     └── DatabaseWorker #3  (registered as {DatabaseWorker, 3})
 └── Todo.Cache  (DynamicSupervisor :one_for_one)
-      ├── Todo.Server "alice"   (registered as {Todo.Server, "alice"}, restart: :temporary)
-      ├── Todo.Server "bob"     (registered as {Todo.Server, "bob"}, restart: :temporary)
-      └── ... (children added on demand, never known up front)
+      ├── Todo.Server "alice"   (registered as {Todo.Server, "alice"}, restart: :temporary, exits after 10s idle)
+      ├── Todo.Server "bob"     (registered as {Todo.Server, "bob"}, restart: :temporary, exits after 10s idle)
+      └── ... (children added on demand; expired ones vanish and are recreated on next access)
 ```
 
-## What Changed vs `dynamic_workers`
+## What Changed vs `todo_metrics`
 
-| File | Before (`dynamic_workers`) | After (`todo_metrics`) |
+| File | Before (`todo_metrics`) | After (`todo_cache_expiry`) |
 |---|---|---|
-| `Todo.Metrics` | did not exist | new `Task` that loops forever, printing memory usage and process count every 10 seconds |
-| `Todo.System` | supervises `Todo.ProcessRegistry`, `Todo.Database`, `Todo.Cache` | additionally supervises `Todo.Metrics` as its first child |
-| `Todo.Cache`, `Todo.Server`, `Todo.Database`, `Todo.DatabaseWorker`, `Todo.ProcessRegistry` | unchanged | unchanged |
+| `Todo.Server` | `GenServer` callbacks return two/three-element tuples with no timeout | every `init`/`handle_continue`/`handle_cast`/`handle_call` clause returns a fourth `@expiry_idle_timeout` element; new `handle_info(:timeout, ...)` stops the process after 10s of inactivity |
+| `Todo.Server` public API | `start_link/1`, `add_entry/2`, `entries/2` | unchanged — same names, arities, and behavior |
+| `Todo.Metrics`, `Todo.System`, `Todo.Cache`, `Todo.Database`, `Todo.DatabaseWorker`, `Todo.ProcessRegistry`, `Todo.List` | — | unchanged |
 
-## `Task` vs `GenServer` for Background Work
+## `GenServer` Timeouts as a Cache-Expiry Mechanism
 
-| | `Task` (`Todo.Metrics`) | `GenServer` |
+| | Without expiry (`todo_metrics`) | With expiry (`todo_cache_expiry`) |
 |---|---|---|
-| Client API (calls/casts) | none — nothing sends it messages | expected — request/response is the point |
-| State | none — everything lives in the loop's arguments | explicit process state |
-| Best fit | fire-and-forget or self-driven loops | request handling, stateful coordination |
+| Idle `Todo.Server` processes | live forever once started | exit after `@expiry_idle_timeout` (10s) of no calls/casts |
+| Memory for inactive lists | held indefinitely | reclaimed automatically |
+| State durability | relies on writes going to `Todo.Database` | unchanged — same guarantee, now also the safety net for expiry |
+| Access after expiry | n/a | transparent — `Todo.Cache.server_process/1` restarts the process and reloads state from `Todo.Database` |
 
-Since nobody ever queries the metrics process and it holds no meaningful state, `Task` keeps it minimal while still being a first-class, supervised OTP process.
+Using the built-in `GenServer` timeout keeps this entirely inside the process's own callbacks — no external janitor process, no `Process.send_after/3` bookkeeping, and no change to any caller. The trade-off is the same timeout value governs both call/cast replies and idle detection, so picking a very small timeout can be indistinguishable from processes never staying alive at all — 10 seconds here is a deliberately short value for demonstration.
 
 ## Try It in IEx
 
 ```elixir
-# Start the supervision tree — Todo.Metrics starts looping immediately
 {:ok, _sup} = Todo.System.start_link()
 
-# Wait ~10 seconds and you'll see output like:
-#=> [memory_usage: 34012345, process_count: 84]
-
-# The rest of the to-do system works exactly as in dynamic_workers
 bobs_list = Todo.Cache.server_process("bob's list")
 Todo.Server.add_entry(bobs_list, %{date: ~D[2024-01-10], title: "Buy milk"})
 Todo.Server.entries(bobs_list, ~D[2024-01-10])
+#=> [%{date: ~D[2024-01-10], title: "Buy milk", id: 1}]
 
-# Adding more servers bumps the process_count reported by Todo.Metrics
-Enum.each(1..50, &Todo.Cache.server_process("list-#{&1}"))
-# next metrics tick will show a higher process_count
+# Wait more than 10 seconds without touching bobs_list...
+Process.sleep(:timer.seconds(11))
+#=> prints "Stopping to-do server for bob's list"
+
+# The old pid is dead, but the data survived in Todo.Database
+Process.alive?(bobs_list)
+#=> false
+
+new_bobs_list = Todo.Cache.server_process("bob's list")
+new_bobs_list != bobs_list
+#=> true
+Todo.Server.entries(new_bobs_list, ~D[2024-01-10])
+#=> [%{date: ~D[2024-01-10], title: "Buy milk", id: 1}]
 ```
