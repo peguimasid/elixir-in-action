@@ -37,4 +37,17 @@ defmodule SimpleRegistry do
   def handle_call({:whereis, key}, _from, process_registry) do
     {:reply, Map.get(process_registry, key), process_registry}
   end
+
+  @impl true
+  def handle_info({:EXIT, pid, _reason}, process_registry) do
+    IO.puts("Process exited: #{inspect(pid)}")
+    new_registry = deregister_pid(process_registry, pid)
+    {:noreply, new_registry}
+  end
+
+  defp deregister_pid(process_registry, pid) do
+    process_registry
+    |> Enum.reject(fn {_key, value} -> value == pid end)
+    |> Enum.into(%{})
+  end
 end
