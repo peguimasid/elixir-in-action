@@ -1,0 +1,1 @@
+{application,process_registry,[{modules,[]},{optional_applications,[]},{applications,[kernel,stdlib,elixir,logger]},{description,"process_registry"},{registered,[]},{vsn,"0.1.0"}]}.
