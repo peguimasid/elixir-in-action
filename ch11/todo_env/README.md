@@ -1,114 +1,106 @@
-# Todo Web — Chapter 11
+# Todo Env — Chapter 11
 
-This project builds on `todo_poolboy`. The Poolboy database pool, cache, registry, and metrics stay the same; the change is **exposing the todo system over HTTP with [Plug](https://github.com/elixir-plug/plug) and [Cowboy](https://github.com/ninenines/cowboy)**.
+This project builds on `todo_web`. The HTTP interface, Poolboy pool, cache, registry, and metrics stay the same; the change is **moving hard-coded settings into [runtime config](https://hexdocs.pm/elixir/Config.html#module-config-provider)** so they can vary by Mix env and OS environment variables.
 
-## The Goal: Talk to the System Over the Network
+## The Goal: Configure Without Recompiling
 
-Until now, clients were IEx sessions in the same BEAM. That works for demos, but a real interface needs an HTTP boundary: accept requests, look up (or start) a list server via `Todo.Cache`, and return a response.
+In `todo_web`, the HTTP port (`5454`) and database folder (`./persist`) lived in the source. That works until you need a different port for tests while IEx is running, a separate persist dir so tests do not wipe the dev DB, or a shorter idle timeout in local development.
 
-`Todo.Web` is a `Plug.Router` that Cowboy serves. It sits in the supervision tree next to the rest of the OTP app — if the HTTP listener dies, the supervisor restarts it like any other child.
+`config/runtime.exs` runs every time the app starts (after compilation). It reads env vars with sensible defaults, then sets Application config that the OTP children fetch at start time.
 
-## The Fix: `Plug.Cowboy.child_spec/1` + `Plug.Router`
+## The Fix: `config/runtime.exs` + `Application.fetch_env!/2`
 
-`mix.exs` adds the dependency (Poolboy remains from the previous step):
+Three settings are externalized:
 
-```elixir
-defp deps do
-  [
-    {:poolboy, "~> 1.5"},
-    {:plug_cowboy, "~> 2.9"}
-  ]
-end
-```
+| Setting | App config | Env var (non-test) | Default |
+|---|---|---|---|
+| HTTP port | `:todo, :http_port` | `TODO_HTTP_PORT` | `5454` |
+| DB folder | `:todo, :database, :db_folder` | `TODO_DB_FOLDER` | `./persist` |
+| Server idle expiry | `:todo, :todo_server_expiry` | `TODO_SERVER_EXPIRY` | `60` s (`10` s in `:dev`) |
 
-`Todo.Web` declares how Cowboy should start it, then routes requests into the existing cache/server API:
+In `:test`, the port and folder use separate vars/defaults (`TODO_TEST_HTTP_PORT` → `5455`, `TODO_TEST_DB_FOLDER` → `./test_persist`) so tests can run alongside a live IEx session without colliding.
 
-```elixir
-def child_spec(_arg) do
-  Plug.Cowboy.child_spec(
-    scheme: :http,
-    options: [port: 5454],
-    plug: __MODULE__
-  )
-end
-
-get "/entries" do
-  conn = Plug.Conn.fetch_query_params(conn)
-  list_name = Map.fetch!(conn.params, "list")
-  date = Date.from_iso8601!(Map.fetch!(conn.params, "date"))
-
-  entries =
-    list_name
-    |> Todo.Cache.server_process()
-    |> Todo.Server.entries(date)
-
-  # ... format and send_resp
-end
-```
-
-`Todo.System` starts the web server as a sibling of the other children:
+`Todo.Web` and `Todo.Database` read config instead of constants:
 
 ```elixir
-Supervisor.start_link(
-  [
-    Todo.Metrics,
-    Todo.ProcessRegistry,
-    Todo.Database,
-    Todo.Cache,
-    Todo.Web
-  ],
-  strategy: :one_for_one
+# Todo.Web
+Plug.Cowboy.child_spec(
+  scheme: :http,
+  options: [port: Application.fetch_env!(:todo, :http_port)],
+  plug: __MODULE__
 )
+
+# Todo.Database
+db_folder = Keyword.fetch!(Application.fetch_env!(:todo, :database), :db_folder)
+```
+
+`Todo.Server` also picks up idle expiry from config (GenServer timeouts on each handle, stop on `:timeout`):
+
+```elixir
+defp expiry_idle_timeout(), do: Application.fetch_env!(:todo, :todo_server_expiry)
 ```
 
 A few things worth noting:
 
-- **`Plug.Cowboy.child_spec/1`** returns a proper OTP child spec — Cowboy (via Ranch) owns acceptors and connection processes under that child.
-- **Routes call the same API as IEx.** `Todo.Cache.server_process/1` and `Todo.Server` are unchanged; HTTP is just another client.
-- **Query params carry the payload** for both `GET /entries` and `POST /add_entry` (title included on the query string for the demo).
-- **Port `5454`** is hard-coded in the child spec for simplicity.
+- **`runtime.exs` is not compile-time.** Changing env vars and restarting is enough; no need to recompile.
+- **Mix env drives defaults.** Test gets an isolated port and folder; dev gets a short server expiry for quicker demos.
+- **Callers stay the same.** Routes, cache, and Poolboy workers do not care where the values came from.
 
 ## Process Tree
+
+Same shape as `todo_web`; only the sources of port / folder / expiry changed:
 
 ```
 Todo.Application  (OTP application callback)
 └── Todo.System  (Supervisor :one_for_one)
       ├── Todo.Metrics  (Task — loops forever, prints metrics every 10s)
       ├── Todo.ProcessRegistry  (Registry — name→pid for servers, not DB workers)
-      ├── Todo.Database  (Poolboy pool, size: 3)
-      │     ├── DatabaseWorker  (pid only — checked out via :poolboy.transaction)
+      ├── Todo.Database  (Poolboy pool, size: 3 — folder from config)
+      │     ├── DatabaseWorker
       │     ├── DatabaseWorker
       │     └── DatabaseWorker
       ├── Todo.Cache  (DynamicSupervisor :one_for_one)
-      │     ├── Todo.Server "alice"   (registered as {Todo.Server, "alice"}, restart: :temporary)
-      │     ├── Todo.Server "bob"     (registered as {Todo.Server, "bob"}, restart: :temporary)
+      │     ├── Todo.Server "alice"   (idle timeout from config, restart: :temporary)
+      │     ├── Todo.Server "bob"
       │     └── ... (children added on demand)
-      └── Todo.Web  (Plug.Cowboy HTTP listener on :5454)
+      └── Todo.Web  (Plug.Cowboy — port from config)
 ```
 
-## What Changed vs `todo_poolboy`
+## What Changed vs `todo_web`
 
-| File | Before (`todo_poolboy`) | After (`todo_web`) |
+| File | Before (`todo_web`) | After (`todo_env`) |
 |---|---|---|
-| `mix.exs` | Poolboy only | + `{:plug_cowboy, "~> 2.9"}` |
-| `Todo.Web` | — | new `Plug.Router` + Cowboy child spec |
-| `Todo.System` | metrics, registry, DB, cache | + `Todo.Web` |
-| Database / cache / servers | unchanged | unchanged |
+| `config/runtime.exs` | — | new — port, db folder, server expiry |
+| `Todo.Web` | hard-coded port `5454` | `Application.fetch_env!(:todo, :http_port)` |
+| `Todo.Database` | `@db_folder "./persist"` | folder from `:todo, :database` |
+| `Todo.Server` | no idle timeout | expiry from `:todo, :todo_server_expiry` |
+| `test/http_server_test.exs` | — | Plug.Test coverage for routes |
+| `test/test_helper.exs` | plain `ExUnit.start()` | clears configured test db folder first |
 
 ## Try It
 
 ```bash
-# Terminal 1
+# Terminal 1 — defaults (port 5454, ./persist)
 iex -S mix
+
+# Or override:
+TODO_HTTP_PORT=8080 TODO_DB_FOLDER=./my_data iex -S mix
 
 # Terminal 2
 curl -d '' 'http://localhost:5454/add_entry?list=bob&date=2018-12-19&title=Dentist'
 curl 'http://localhost:5454/entries?list=bob&date=2018-12-19'
 ```
 
+### Run tests (isolated port / folder)
+
+```bash
+mix test
+# uses port 5455 and ./test_persist by default
+```
+
 ### Load test with wrk
 
-`wrk.lua` hammers random lists with a mix of GET/POST. Delete `persist/` first, start in prod, then run wrk from another shell:
+Same as `todo_web`. Delete `persist/` first, start in prod, then run wrk from another shell:
 
 ```bash
 # Terminal 1 — delete persist/, then:

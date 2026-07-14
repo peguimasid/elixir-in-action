@@ -24,4 +24,5 @@ todo-*.tar
 
 # our app Db
 /persist/
+/test_persist/
 
