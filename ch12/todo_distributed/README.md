@@ -1,111 +1,182 @@
-# Todo Env — Chapter 11
+# Todo Distributed — Chapter 12
 
-This project builds on `todo_web`. The HTTP interface, Poolboy pool, cache, registry, and metrics stay the same; the change is **moving hard-coded settings into [runtime config](https://hexdocs.pm/elixir/Config.html#module-config-provider)** so they can vary by Mix env and OS environment variables.
+This project builds on `todo_env`. Runtime config, HTTP, Poolboy, and the cache stay in place; the change is **running the same OTP app on multiple BEAM nodes** so todo servers are discoverable cluster-wide and writes are replicated to every node's local database.
 
-## The Goal: Configure Without Recompiling
+## The Goal: One Logical System Across Nodes
 
-In `todo_web`, the HTTP port (`5454`) and database folder (`./persist`) lived in the source. That works until you need a different port for tests while IEx is running, a separate persist dir so tests do not wipe the dev DB, or a shorter idle timeout in local development.
+In `todo_env`, a todo list name maps to a process via a **local** `Registry`. That only works inside one BEAM. Start a second node and you get a second, independent system: separate caches, separate files under `./persist`, no shared identity.
 
-`config/runtime.exs` runs every time the app starts (after compilation). It reads env vars with sensible defaults, then sets Application config that the OTP children fetch at start time.
+Chapter 12 connects named nodes into a cluster and makes two things cluster-aware:
 
-## The Fix: `config/runtime.exs` + `Application.fetch_env!/2`
+1. **Process discovery** — at most one `Todo.Server` per list name across the cluster (`:global`)
+2. **Data replication** — a store on one node is written on every connected node (`:rpc.multicall`)
 
-Three settings are externalized:
+Each node still keeps its own on-disk folder (so two nodes started from the same project root do not clobber each other). Replication keeps those folders in sync on write.
 
-| Setting | App config | Env var (non-test) | Default |
-|---|---|---|---|
-| HTTP port | `:todo, :http_port` | `TODO_HTTP_PORT` | `5454` |
-| DB folder | `:todo, :database, :db_folder` | `TODO_DB_FOLDER` | `./persist` |
-| Server idle expiry | `:todo, :todo_server_expiry` | `TODO_SERVER_EXPIRY` | `60` s (`10` s in `:dev`) |
+## The Fix: `:global` Names + `:rpc.multicall`
 
-In `:test`, the port and folder use separate vars/defaults (`TODO_TEST_HTTP_PORT` → `5455`, `TODO_TEST_DB_FOLDER` → `./test_persist`) so tests can run alongside a live IEx session without colliding.
+### Cluster-wide server names
 
-`Todo.Web` and `Todo.Database` read config instead of constants:
+`Todo.ProcessRegistry` is gone. Servers register with Erlang's global name service instead:
 
 ```elixir
-# Todo.Web
-Plug.Cowboy.child_spec(
-  scheme: :http,
-  options: [port: Application.fetch_env!(:todo, :http_port)],
-  plug: __MODULE__
-)
+# Todo.Server
+def start_link(name) do
+  GenServer.start_link(Todo.Server, name, name: global_name(name))
+end
 
-# Todo.Database
-db_folder = Keyword.fetch!(Application.fetch_env!(:todo, :database), :db_folder)
+def whereis(name) do
+  case :global.whereis_name({__MODULE__, name}) do
+    :undefined -> nil
+    pid -> pid
+  end
+end
+
+defp global_name(name), do: {:global, {__MODULE__, name}}
 ```
 
-`Todo.Server` also picks up idle expiry from config (GenServer timeouts on each handle, stop on `:timeout`):
+`Todo.Cache` looks up the global name first, then starts a child only if none exists. That way a request on node2 can reuse a server already running on node1:
 
 ```elixir
-defp expiry_idle_timeout(), do: Application.fetch_env!(:todo, :todo_server_expiry)
+def server_process(todo_list_name) do
+  existing_process(todo_list_name) || new_process(todo_list_name)
+end
+```
+
+If two nodes race to start the same list, `DynamicSupervisor.start_child/2` may return `{:error, {:already_started, pid}}` — the cache returns that pid either way.
+
+### Replicated stores, local reads
+
+`Todo.Database.store/2` no longer writes only locally. It fans out to every connected node:
+
+```elixir
+def store(key, data) do
+  {_results, bad_nodes} =
+    :rpc.multicall(__MODULE__, :store_local, [key, data], :timer.seconds(5))
+
+  Enum.each(bad_nodes, &IO.puts("Store failed on node #{&1}"))
+  :ok
+end
+```
+
+`store_local/2` is the Poolboy checkout that used to be `store/2`. Reads stay local (`get/1`) — once replication has run, any node can load the list from its own disk.
+
+The database folder is scoped by the short node name so multiple nodes share one project tree safely:
+
+```elixir
+[name_prefix, _] = "#{node()}" |> String.split("@")
+db_folder = "#{Keyword.fetch!(db_settings, :db_folder)}/#{name_prefix}/"
+# e.g. ./persist/node1/, ./persist/node2/
+```
+
+### Synchronous workers
+
+`Todo.DatabaseWorker.store/2` is a `GenServer.call` (was a cast). Multicall needs the remote write to finish before the RPC returns; fire-and-forget casts would race with later reads on other nodes.
+
+### Supervision tree
+
+`Todo.ProcessRegistry` is removed from `Todo.System`. Metrics is commented out for this chapter's demos (noise while juggling multiple shells):
+
+```elixir
+Supervisor.start_link(
+  [
+    # Todo.Metrics,
+    Todo.Database,
+    Todo.Cache,
+    Todo.Web
+  ],
+  strategy: :one_for_one
+)
 ```
 
 A few things worth noting:
 
-- **`runtime.exs` is not compile-time.** Changing env vars and restarting is enough; no need to recompile.
-- **Mix env drives defaults.** Test gets an isolated port and folder; dev gets a short server expiry for quicker demos.
-- **Callers stay the same.** Routes, cache, and Poolboy workers do not care where the values came from.
+- **`:global` is cluster-wide.** After `Node.connect/1`, `whereis` and name registration see processes on other nodes.
+- **Replication is eager on write.** A successful `add_entry` on one node should leave the same term on every node's disk (failed nodes are logged via `bad_nodes`).
+- **HTTP is unchanged.** Each node can listen on its own port (`TODO_HTTP_PORT`); the interesting part is which node owns the list server and that stores hit the whole cluster.
+- **Callers stay the same.** Routes and IEx still go through `Todo.Cache.server_process/1`.
 
 ## Process Tree
 
-Same shape as `todo_web`; only the sources of port / folder / expiry changed:
+Per node (shape is almost `todo_env`, minus registry/metrics):
 
 ```
 Todo.Application  (OTP application callback)
 └── Todo.System  (Supervisor :one_for_one)
-      ├── Todo.Metrics  (Task — loops forever, prints metrics every 10s)
-      ├── Todo.ProcessRegistry  (Registry — name→pid for servers, not DB workers)
-      ├── Todo.Database  (Poolboy pool, size: 3 — folder from config)
+      ├── Todo.Database  (Poolboy pool, size: 3 — folder ./persist/<node>/)
       │     ├── DatabaseWorker
       │     ├── DatabaseWorker
       │     └── DatabaseWorker
       ├── Todo.Cache  (DynamicSupervisor :one_for_one)
-      │     ├── Todo.Server "alice"   (idle timeout from config, restart: :temporary)
-      │     ├── Todo.Server "bob"
-      │     └── ... (children added on demand)
+      │     └── Todo.Server "bob"   (named {:global, {Todo.Server, "bob"}})
+      │           └── may live on this node or another; cache uses whereis first
       └── Todo.Web  (Plug.Cowboy — port from config)
 ```
 
-## What Changed vs `todo_web`
+Across two connected nodes:
 
-| File | Before (`todo_web`) | After (`todo_env`) |
+```
+node1@...                         node2@...
+├── Database → ./persist/node1/   ├── Database → ./persist/node2/
+├── Cache (may start servers)     ├── Cache (may start servers)
+└── Web :5454                     └── Web :5455
+
+store → :rpc.multicall → store_local on node1 and node2
+```
+
+## What Changed vs `todo_env`
+
+| File | Before (`todo_env`) | After (`todo_distributed`) |
 |---|---|---|
-| `config/runtime.exs` | — | new — port, db folder, server expiry |
-| `Todo.Web` | hard-coded port `5454` | `Application.fetch_env!(:todo, :http_port)` |
-| `Todo.Database` | `@db_folder "./persist"` | folder from `:todo, :database` |
-| `Todo.Server` | no idle timeout | expiry from `:todo, :todo_server_expiry` |
-| `test/http_server_test.exs` | — | Plug.Test coverage for routes |
-| `test/test_helper.exs` | plain `ExUnit.start()` | clears configured test db folder first |
+| `Todo.ProcessRegistry` | local `Registry` for server names | **removed** |
+| `Todo.Server` | `via` Registry tuple | `{:global, {Todo.Server, name}}` + `whereis/1` |
+| `Todo.Cache` | always `start_child` | `whereis` then start; handle `:already_started` |
+| `Todo.Database` | single `./persist` folder, local `store` | per-node subfolder; `store` → multicall `store_local` |
+| `Todo.DatabaseWorker` | `store` via cast | `store` via call (sync for RPC) |
+| `Todo.System` | Metrics + ProcessRegistry + … | Metrics commented out; no ProcessRegistry |
 
 ## Try It
 
-```bash
-# Terminal 1 — defaults (port 5454, ./persist)
-iex -S mix
+Start two named nodes from `ch12/todo_distributed`, give them different HTTP ports, then connect them.
 
-# Or override:
-TODO_HTTP_PORT=8080 TODO_DB_FOLDER=./my_data iex -S mix
+```bash
+# Terminal 1
+TODO_HTTP_PORT=5454 iex --sname node1 -S mix
 
 # Terminal 2
-curl -d '' 'http://localhost:5454/add_entry?list=bob&date=2018-12-19&title=Dentist'
-curl 'http://localhost:5454/entries?list=bob&date=2018-12-19'
+TODO_HTTP_PORT=5455 iex --sname node2 -S mix
 ```
 
-### Run tests (isolated port / folder)
+In either IEx session, connect the cluster (use the host suffix `Node.self()` prints, often your machine short name):
+
+```elixir
+Node.connect(:node2@yourhost)   # from node1
+Node.list()                     # should include the other node
+```
+
+Add an entry via node1's HTTP port, then read it from node2 — the list server is unique cluster-wide, and the write was replicated:
+
+```bash
+# Terminal 3
+curl -d '' 'http://localhost:5454/add_entry?list=bob&date=2018-12-19&title=Dentist'
+curl 'http://localhost:5455/entries?list=bob&date=2018-12-19'
+```
+
+You should also see files under both `./persist/node1/` and `./persist/node2/`.
+
+### Same APIs from IEx
+
+```elixir
+bob = Todo.Cache.server_process("bob")
+Todo.Server.add_entry(bob, %{date: ~D[2018-12-19], title: "Dentist"})
+Todo.Server.entries(bob, ~D[2018-12-19])
+```
+
+Call `Todo.Cache.server_process("bob")` on the other node: you get the **same** pid (or a local one only if none existed yet).
+
+### Run tests
 
 ```bash
 mix test
-# uses port 5455 and ./test_persist by default
-```
-
-### Load test with wrk
-
-Same as `todo_web`. Delete `persist/` first, start in prod, then run wrk from another shell:
-
-```bash
-# Terminal 1 — delete persist/, then:
-MIX_ENV=prod iex -S mix
-
-# Terminal 2
-wrk -t4 -c28 -d30s --latency -s wrk.lua http://localhost:5454
+# uses port 5455 and ./test_persist/<node>/ by default
 ```
